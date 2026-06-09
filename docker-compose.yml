@@ -10,6 +10,14 @@ services:
       - SKIP_ACCOUNT_MENU=true
     ports:
       - "${PORT:-3264}:3264"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+      - /home/appuser/.cache:rw,noexec,nosuid,size=256m
     volumes:
       - ./session:/app/session
       - ./logs:/app/logs

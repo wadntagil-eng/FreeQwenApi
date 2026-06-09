@@ -81,6 +81,38 @@ npm run auth -- --remove
 - `Authorization.txt`
 - cookies / browser profile / реальные токены
 
+
+## Настройки безопасности
+
+- `Authorization.txt` задаёт Bearer-токены для доступа к прокси; если файл пустой или содержит только комментарии, API работает без авторизации.
+- `ALLOWED_ORIGINS` ограничивает CORS-источники через список origin, разделённых запятыми. По умолчанию используется `*` для обратной совместимости.
+- `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS`, `RATE_LIMIT_AUTH_MAX_REQUESTS` настраивают in-memory rate limiting для входящих API-запросов. Если сервис стоит за доверенным reverse proxy, включите `TRUST_PROXY=true` для корректного IP в Node.js.
+- `MAX_JSON_BODY_SIZE`, `MAX_REQUEST_MESSAGES`, `MAX_REQUEST_TEXT_CHARS` ограничивают размер JSON-тела, количество сообщений и суммарный объём текстовых полей. Для Python используется `MAX_JSON_BODY_BYTES`.
+- Upstream URL (`QWEN_BASE_URL`, `CHAT_API_URL` и др.) должны использовать `https://`; локальные и приватные адреса блокируются, если явно не задано `ALLOW_PRIVATE_UPSTREAMS=true`. DNS upstream-хостов дополнительно проверяется перед API-запросами, чтобы снизить риск DNS rebinding.
+- `session/` и `session/tokens.json` создаются с приватными правами (`0700` для директории, `0600` для файлов с токенами).
+
+Пример:
+
+```bash
+ALLOWED_ORIGINS=https://openwebui.example.com,http://localhost:3000 \
+RATE_LIMIT_MAX_REQUESTS=120 \
+RATE_LIMIT_AUTH_MAX_REQUESTS=600 \
+MAX_JSON_BODY_SIZE=10mb \
+npm start
+```
+
+
+### Аудит зависимостей
+
+`package-lock.json` в репозитории игнорируется, поэтому `npm audit` нужно запускать после генерации lockfile в отдельном окружении:
+
+```bash
+npm install --package-lock-only
+npm audit --omit=dev
+python -m pip install pip-audit
+python -m pip_audit -r requirements.txt
+```
+
 ## Основные endpoints
 
 ### Health

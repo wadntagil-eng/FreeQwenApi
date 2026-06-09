@@ -13,9 +13,16 @@ import { SESSION_DIR, ACCOUNTS_DIR } from '../config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+
+function writePrivateAccountToken(filePath, token) {
+    fs.writeFileSync(filePath, token, { encoding: 'utf8', mode: 0o600 });
+    try { fs.chmodSync(filePath, 0o600); } catch { /* best effort on mounted filesystems */ }
+}
+
 function ensureAccountDir(id) {
     const accountDir = path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, id);
-    if (!fs.existsSync(accountDir)) fs.mkdirSync(accountDir, { recursive: true });
+    if (!fs.existsSync(accountDir)) fs.mkdirSync(accountDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(accountDir, 0o700); } catch { /* best effort on mounted filesystems */ }
     return accountDir;
 }
 
@@ -50,7 +57,7 @@ export async function addAccountInteractive() {
 
     const id = 'acc_' + Date.now();
     ensureAccountDir(id);
-    fs.writeFileSync(path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, id, 'token.txt'), token, 'utf8');
+    writePrivateAccountToken(path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, id, 'token.txt'), token);
 
     const list = loadTokens();
     list.push({ id, token, resetAt: null });
@@ -104,7 +111,7 @@ export async function reloginAccountInteractive() {
     if (!token) { logError('Не удалось извлечь токен.'); return; }
 
     markValid(account.id, token);
-    fs.writeFileSync(path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, account.id, 'token.txt'), token, 'utf8');
+    writePrivateAccountToken(path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, account.id, 'token.txt'), token);
     logInfo(`Токен обновлён для ${account.id}`);
 }
 
