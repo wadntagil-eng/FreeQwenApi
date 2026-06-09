@@ -33,8 +33,22 @@ export function createChat(chatName) {
     return chatId;
 }
 
+function getSafeChatIdForFilename(chatId) {
+    const rawChatId = String(chatId ?? '');
+    if (/^[a-zA-Z0-9_-]{1,128}$/.test(rawChatId)) return rawChatId;
+
+    return `chat_${crypto.createHash('sha256').update(rawChatId).digest('hex').substring(0, 32)}`;
+}
+
 function getHistoryFilePath(chatId) {
-    return path.join(HISTORY_DIR, `${chatId}.json`);
+    const safeChatId = getSafeChatIdForFilename(chatId);
+    const historyFilePath = path.resolve(HISTORY_DIR, `${safeChatId}.json`);
+
+    if (!historyFilePath.startsWith(`${HISTORY_DIR}${path.sep}`)) {
+        throw new Error('Некорректный путь к файлу истории');
+    }
+
+    return historyFilePath;
 }
 
 export function saveHistory(chatId, data) {

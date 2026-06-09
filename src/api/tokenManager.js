@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { logError } from '../logger/index.js';
+import { logError, logWarn } from '../logger/index.js';
 import { SESSION_DIR, ACCOUNTS_DIR } from '../config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -12,9 +12,29 @@ const TOKENS_FILE = path.join(SESSION_PATH, 'tokens.json');
 
 let pointer = 0;
 
+function chmodIfPossible(targetPath, mode) {
+    try {
+        fs.chmodSync(targetPath, mode);
+    } catch (error) {
+        logWarn(`TokenManager: не удалось выставить права ${mode.toString(8)} для ${targetPath}: ${error.message}`);
+    }
+}
+
+function ensurePrivateDir(dirPath) {
+    if (!fs.existsSync(dirPath)) {
+        fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+    }
+    chmodIfPossible(dirPath, 0o700);
+}
+
+function ensurePrivateFile(filePath) {
+    if (fs.existsSync(filePath)) chmodIfPossible(filePath, 0o600);
+}
+
 function ensureSessionDir() {
-    if (!fs.existsSync(SESSION_PATH)) fs.mkdirSync(SESSION_PATH, { recursive: true });
-    if (!fs.existsSync(ACCOUNTS_PATH)) fs.mkdirSync(ACCOUNTS_PATH, { recursive: true });
+    ensurePrivateDir(SESSION_PATH);
+    ensurePrivateDir(ACCOUNTS_PATH);
+    ensurePrivateFile(TOKENS_FILE);
 }
 
 export function loadTokens() {
@@ -31,7 +51,8 @@ export function loadTokens() {
 export function saveTokens(tokens) {
     ensureSessionDir();
     try {
-        fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), 'utf8');
+        fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), { encoding: 'utf8', mode: 0o600 });
+        chmodIfPossible(TOKENS_FILE, 0o600);
     } catch (e) {
         logError('TokenManager: ошибка сохранения tokens.json', e);
     }

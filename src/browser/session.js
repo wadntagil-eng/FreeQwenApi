@@ -15,8 +15,22 @@ function getSessionFilePath(accountId, fileName) {
         : path.join(SESSION_PATH, fileName);
 }
 
+function chmodIfPossible(targetPath, mode) {
+    try {
+        fs.chmodSync(targetPath, mode);
+    } catch (error) {
+        logWarn(`Не удалось выставить права ${mode.toString(8)} для ${targetPath}: ${error.message}`);
+    }
+}
+
 function ensureDir(dirPath) {
-    if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
+    if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
+    chmodIfPossible(dirPath, 0o700);
+}
+
+function writePrivateFile(filePath, data) {
+    fs.writeFileSync(filePath, data, { encoding: 'utf8', mode: 0o600 });
+    chmodIfPossible(filePath, 0o600);
 }
 
 export function initSessionDirectory() {
@@ -33,7 +47,7 @@ export async function saveSession(context, accountId = null) {
             const cookies = await context.cookies();
             const sessionPath = getSessionFilePath(accountId, 'cookies.json');
             ensureDir(path.dirname(sessionPath));
-            fs.writeFileSync(sessionPath, JSON.stringify(cookies, null, 2));
+            writePrivateFile(sessionPath, JSON.stringify(cookies, null, 2));
             logInfo('Сессия Puppeteer сохранена');
             return true;
         }
@@ -110,7 +124,7 @@ export function saveAuthToken(token) {
     try {
         initSessionDirectory();
         if (token) {
-            fs.writeFileSync(TOKEN_FILE, token, 'utf8');
+            writePrivateFile(TOKEN_FILE, token);
             logInfo('Токен авторизации сохранен');
             return true;
         }

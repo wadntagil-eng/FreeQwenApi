@@ -25,6 +25,25 @@ const fileFormat = combine(
     printf(({ level, message, timestamp }) => `${timestamp} [${level}]: ${message}`)
 );
 
+
+function sanitizeLogValue(value) {
+    if (value === null || value === undefined) return '';
+
+    let text;
+    try {
+        text = typeof value === 'string' ? value : JSON.stringify(value);
+    } catch {
+        text = String(value);
+    }
+
+    return text
+        .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [REDACTED]')
+        .replace(/(authorization["'\s:=]+)(Bearer\s+)?[^"'\s,}]+/gi, '$1[REDACTED]')
+        .replace(/(cookie["'\s:=]+)[^"'\n]+/gi, '$1[REDACTED]')
+        .replace(/(["']?(?:token|access_token|auth_token|security_token|access_key_secret|api[_-]?key)["']?\s*[:=]\s*["'])[^"']+(["'])/gi, '$1[REDACTED]$2')
+        .replace(/(session(?:id)?["'\s:=]+)[^"'\s,}]+/gi, '$1[REDACTED]');
+}
+
 const customLevels = {
     levels: { error: 0, warn: 1, info: 2, http: 3, debug: 4, raw: 5 },
     colors: { error: 'red', warn: 'yellow', info: 'green', http: 'cyan', debug: 'blue', raw: 'magenta' }
@@ -65,25 +84,25 @@ const logger = winston.createLogger({
 winston.addColors(customLevels.colors);
 
 const morganStream = {
-    write: (message) => logger.http(message.trim())
+    write: (message) => logger.http(sanitizeLogValue(message.trim()))
 };
 
 const morganFormat = ':remote-addr :method :url :status :res[content-length] - :response-time ms';
 const httpLogger = morgan(morganFormat, { stream: morganStream });
 
 export const logHttpRequest = httpLogger;
-export const logInfo = (message) => logger.info(message);
+export const logInfo = (message) => logger.info(sanitizeLogValue(message));
 export const logError = (message, error) => {
     if (error) {
-        logger.error(`${message}: ${error.message}`);
-        logger.error(error.stack);
+        logger.error(sanitizeLogValue(`${message}: ${error.message}`));
+        logger.error(sanitizeLogValue(error.stack));
     } else {
-        logger.error(message);
+        logger.error(sanitizeLogValue(message));
     }
 };
-export const logWarn = (message) => logger.warn(message);
-export const logDebug = (message) => logger.debug(message);
-export const logRaw = (message) => logger.raw(message);
-export const logHttp = (message) => logger.http(message);
+export const logWarn = (message) => logger.warn(sanitizeLogValue(message));
+export const logDebug = (message) => logger.debug(sanitizeLogValue(message));
+export const logRaw = (message) => logger.raw(sanitizeLogValue(message));
+export const logHttp = (message) => logger.http(sanitizeLogValue(message));
 
 export default { logHttpRequest, logInfo, logError, logWarn, logDebug, logRaw, logHttp };

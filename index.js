@@ -1,5 +1,6 @@
 import express from 'express';
 import bodyParser from 'body-parser';
+import crypto from 'crypto';
 
 import { initBrowser, shutdownBrowser } from './src/browser/browser.js';
 import apiRoutes from './src/api/routes.js';
@@ -9,9 +10,14 @@ import { addAccountInteractive } from './src/utils/accountSetup.js';
 import { logHttpRequest, logInfo, logError, logWarn } from './src/logger/index.js';
 import { prompt } from './src/utils/prompt.js';
 import { FORGETMEAI_WATERMARK } from './src/utils/branding.js';
-import { PORT, HOST } from './src/config.js';
+import {
+    PORT, HOST, ALLOWED_ORIGINS, MAX_JSON_BODY_SIZE,
+    RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_AUTH_MAX_REQUESTS,
+    validateUpstreamDns
+} from './src/config.js';
 
 const app = express();
+if (toBoolean(process.env.TRUST_PROXY)) app.set('trust proxy', true);
 
 const port = Number.parseInt(process.env.PORT ?? PORT, 10);
 const host = process.env.HOST || HOST;
@@ -26,6 +32,57 @@ function toBoolean(value) {
 }
 
 const skipAccountMenu = toBoolean(process.env.SKIP_ACCOUNT_MENU) || toBoolean(process.env.NON_INTERACTIVE);
+
+const rateLimitBuckets = new Map();
+
+function getRateLimitKey(req) {
+    const authHeader = req.get('Authorization') || '';
+    if (authHeader.startsWith('Bearer ')) {
+        return `auth:${crypto.createHash('sha256').update(authHeader.substring(7).trim()).digest('hex')}`;
+    }
+
+    return `ip:${req.ip || req.socket?.remoteAddress || 'unknown'}`;
+}
+
+function rateLimitMiddleware(req, res, next) {
+    const now = Date.now();
+    const hasBearerToken = (req.get('Authorization') || '').startsWith('Bearer ');
+    const maxRequests = hasBearerToken ? RATE_LIMIT_AUTH_MAX_REQUESTS : RATE_LIMIT_MAX_REQUESTS;
+    const windowMs = RATE_LIMIT_WINDOW_MS;
+    const key = getRateLimitKey(req);
+    const bucket = rateLimitBuckets.get(key);
+
+    if (!bucket || bucket.resetAt <= now) {
+        rateLimitBuckets.set(key, { count: 1, resetAt: now + windowMs });
+        return next();
+    }
+
+    bucket.count += 1;
+    if (bucket.count > maxRequests) {
+        const retryAfter = Math.ceil((bucket.resetAt - now) / 1000);
+        res.header('Retry-After', String(retryAfter));
+        return res.status(429).json({ error: 'Слишком много запросов', retryAfter });
+    }
+
+    return next();
+}
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, bucket] of rateLimitBuckets.entries()) {
+        if (bucket.resetAt <= now) rateLimitBuckets.delete(key);
+    }
+}, RATE_LIMIT_WINDOW_MS).unref();
+
+async function upstreamDnsGuardMiddleware(req, res, next) {
+    try {
+        await validateUpstreamDns();
+        return next();
+    } catch (error) {
+        logError('Проверка DNS upstream URL не пройдена', error);
+        return res.status(502).json({ error: 'Upstream URL failed DNS safety check' });
+    }
+}
 
 function ensureNonInteractiveTokens() {
     const tokens = loadTokens();
@@ -43,8 +100,8 @@ function ensureNonInteractiveTokens() {
 }
 
 app.use(logHttpRequest);
-app.use(bodyParser.json({ limit: '150mb' }));
-app.use(bodyParser.urlencoded({ limit: '150mb', extended: true }));
+app.use(bodyParser.json({ limit: MAX_JSON_BODY_SIZE }));
+app.use(bodyParser.urlencoded({ limit: MAX_JSON_BODY_SIZE, extended: true }));
 
 app.use((err, req, res, next) => {
     const isJsonSyntaxError = err instanceof SyntaxError && err.status === 400 && Object.prototype.hasOwnProperty.call(err, 'body');
@@ -57,18 +114,31 @@ app.use((err, req, res, next) => {
         });
     }
 
+    if (err?.type === 'entity.too.large' || err?.status === 413) {
+        logWarn(`Тело запроса слишком большое: ${err.message}`);
+        return res.status(413).json({ error: 'Тело запроса слишком большое' });
+    }
+
     return next(err);
 });
 
 app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
+    const requestOrigin = req.get('Origin');
+    const allowsWildcard = ALLOWED_ORIGINS.includes('*');
+    const allowedOrigin = allowsWildcard ? '*' : ALLOWED_ORIGINS.find(origin => origin === requestOrigin);
+
+    if (allowedOrigin) {
+        res.header('Access-Control-Allow-Origin', allowedOrigin);
+        if (!allowsWildcard) res.header('Vary', 'Origin');
+    }
+
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
+    if (req.method === 'OPTIONS') return res.sendStatus(allowedOrigin ? 204 : 403);
     next();
 });
 
-app.use('/api', apiRoutes);
+app.use('/api', rateLimitMiddleware, upstreamDnsGuardMiddleware, apiRoutes);
 
 app.use((req, res) => {
     logWarn(`404 Not Found: ${req.method} ${req.originalUrl}`);

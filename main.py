@@ -5,7 +5,13 @@ import uuid
 import asyncio
 import sys
 import logging
+import secrets
+import hashlib
+import ipaddress
+import re
+import socket
 from datetime import datetime
+from urllib.parse import urlparse
 from typing import List, Optional, Dict, Any, Union
 
 import httpx
@@ -25,14 +31,82 @@ load_dotenv()
 # =================================================================
 PORT = int(os.environ.get("PORT", 3264))
 HOST = os.environ.get("HOST", "0.0.0.0")
-QWEN_BASE_URL = "https://chat.qwen.ai"
-CHAT_PAGE_URL = f"{QWEN_BASE_URL}/"
-CHAT_API_URL = f"{QWEN_BASE_URL}/api/v2/chat/completions"
-CREATE_CHAT_URL = f"{QWEN_BASE_URL}/api/v2/chats/new"
 SESSION_DIR = "session"
 TOKENS_FILE = os.path.join(SESSION_DIR, "tokens.json")
 DEFAULT_MODEL = "qwen-max-latest"
 AVAILABLE_MODELS_FILE = os.path.join("src", "AvailableModels.txt")
+AUTH_KEYS_FILE = os.path.join("src", "Authorization.txt")
+ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_MS", "60000")) / 1000
+RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "120"))
+RATE_LIMIT_AUTH_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_AUTH_MAX_REQUESTS", "600"))
+MAX_JSON_BODY_BYTES = int(os.environ.get("MAX_JSON_BODY_BYTES", str(10 * 1024 * 1024)))
+MAX_REQUEST_MESSAGES = int(os.environ.get("MAX_REQUEST_MESSAGES", "100"))
+MAX_REQUEST_TEXT_CHARS = int(os.environ.get("MAX_REQUEST_TEXT_CHARS", "1000000"))
+
+def is_private_hostname(hostname: str) -> bool:
+    if not hostname:
+        return True
+    normalized = hostname.strip("[]").lower()
+    if normalized in {"localhost", "0", "0.0.0.0", "::", "::1"}:
+        return True
+    if normalized.endswith(".localhost") or normalized.endswith(".local"):
+        return True
+    try:
+        ip = ipaddress.ip_address(normalized)
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    except ValueError:
+        return False
+
+def safe_upstream_url(value: str, name: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme != "https":
+        raise ValueError(f"{name} должен использовать https://")
+    if os.environ.get("ALLOW_PRIVATE_UPSTREAMS", "").lower() not in {"1", "true", "yes", "on"} and is_private_hostname(parsed.hostname or ""):
+        raise ValueError(f"{name} указывает на локальный или приватный хост: {parsed.hostname}")
+    return value
+
+QWEN_BASE_URL = safe_upstream_url(os.environ.get("QWEN_BASE_URL", "https://chat.qwen.ai"), "QWEN_BASE_URL")
+CHAT_PAGE_URL = safe_upstream_url(os.environ.get("CHAT_PAGE_URL", f"{QWEN_BASE_URL}/"), "CHAT_PAGE_URL")
+CHAT_API_URL = safe_upstream_url(os.environ.get("CHAT_API_URL", f"{QWEN_BASE_URL}/api/v2/chat/completions"), "CHAT_API_URL")
+CREATE_CHAT_URL = safe_upstream_url(os.environ.get("CREATE_CHAT_URL", f"{QWEN_BASE_URL}/api/v2/chats/new"), "CREATE_CHAT_URL")
+
+async def validate_upstream_dns():
+    if os.environ.get("ALLOW_PRIVATE_UPSTREAMS", "").lower() in {"1", "true", "yes", "on"}:
+        return
+
+    checked_hosts = set()
+    for name, value in {
+        "QWEN_BASE_URL": QWEN_BASE_URL,
+        "CHAT_PAGE_URL": CHAT_PAGE_URL,
+        "CHAT_API_URL": CHAT_API_URL,
+        "CREATE_CHAT_URL": CREATE_CHAT_URL,
+    }.items():
+        hostname = urlparse(value).hostname
+        if not hostname or hostname in checked_hosts:
+            continue
+        checked_hosts.add(hostname)
+        addrinfo = await asyncio.to_thread(socket.getaddrinfo, hostname, None)
+        for family, _, _, _, sockaddr in addrinfo:
+            address = sockaddr[0]
+            if is_private_hostname(address):
+                raise ValueError(f"{name} DNS resolved {hostname} to private address {address}")
+
+def count_text_characters(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(count_text_characters(item) for item in value)
+    if isinstance(value, dict):
+        return sum(count_text_characters(item) for item in value.values())
+    return 0
+
+def validate_request_payload(body: Dict[str, Any]):
+    messages = body.get("messages") if isinstance(body.get("messages"), list) else []
+    if len(messages) > MAX_REQUEST_MESSAGES:
+        raise HTTPException(status_code=413, detail=f"Слишком много сообщений в запросе: максимум {MAX_REQUEST_MESSAGES}")
+    if count_text_characters(body) > MAX_REQUEST_TEXT_CHARS:
+        raise HTTPException(status_code=413, detail=f"Слишком большой текстовый payload: максимум {MAX_REQUEST_TEXT_CHARS} символов")
 
 # =================================================================
 # MODEL MAPPING (Embedded for standalone usage)
@@ -71,13 +145,34 @@ def load_available_models() -> List[str]:
 logging.basicConfig(level=logging.DEBUG, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("FreeQwenApi")
 
+SECRET_PATTERNS = [
+    (re.compile(r"Bearer\s+[A-Za-z0-9._~+\/-]+=*", re.IGNORECASE), "Bearer [REDACTED]"),
+    (re.compile(r"(authorization[\"'\s:=]+)(Bearer\s+)?[^\"'\s,}]+", re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"(cookie[\"'\s:=]+)[^\"'\n]+", re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"([\"']?(?:token|access_token|auth_token|security_token|access_key_secret|api[_-]?key)[\"']?\s*[:=]\s*[\"'])[^\"']+([\"'])", re.IGNORECASE), r"\1[REDACTED]\2"),
+]
+
+class RedactingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        for pattern, replacement in SECRET_PATTERNS:
+            message = pattern.sub(replacement, message)
+        record.msg = message
+        record.args = ()
+        return True
+
+logger.addFilter(RedactingFilter())
+
 # Глобальный HTTP-клиент для сохранения кук (сессии)
 http_client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
 # TOKEN MANAGEMENT
 # =================================================================
 def ensure_session_dir():
     if not os.path.exists(SESSION_DIR):
-        os.makedirs(SESSION_DIR, exist_ok=True)
+        os.makedirs(SESSION_DIR, mode=0o700, exist_ok=True)
+    os.chmod(SESSION_DIR, 0o700)
+    if os.path.exists(TOKENS_FILE):
+        os.chmod(TOKENS_FILE, 0o600)
 
 def load_tokens():
     ensure_session_dir()
@@ -93,8 +188,10 @@ def load_tokens():
 def save_tokens(tokens):
     ensure_session_dir()
     try:
-        with open(TOKENS_FILE, "w", encoding="utf-8") as f:
+        fd = os.open(TOKENS_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(tokens, f, indent=2, ensure_ascii=False)
+        os.chmod(TOKENS_FILE, 0o600)
     except Exception as e:
         logger.error(f"Ошибка сохранения tokens.json: {e}")
 
@@ -530,6 +627,16 @@ async def execute_qwen_completion(token_obj, chat_id, payload, on_chunk=None):
             "details": str(e)
         }
 
+
+def load_api_keys() -> List[str]:
+    if not os.path.exists(AUTH_KEYS_FILE):
+        return []
+    with open(AUTH_KEYS_FILE, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+def is_authorized_api_key(token: str, api_keys: List[str]) -> bool:
+    return any(secrets.compare_digest(token, api_key) for api_key in api_keys)
+
 # =================================================================
 # FASTAPI APP
 # =================================================================
@@ -537,11 +644,81 @@ app = FastAPI(title="FreeQwenApi Python")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
+
+@app.middleware("http")
+async def body_size_middleware(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_JSON_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"error": "Тело запроса слишком большое"})
+    return await call_next(request)
+
+@app.middleware("http")
+async def upstream_dns_guard_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api"):
+        try:
+            await validate_upstream_dns()
+        except Exception as exc:
+            logger.error(f"Проверка DNS upstream URL не пройдена: {exc}")
+            return JSONResponse(status_code=502, content={"error": "Upstream URL failed DNS safety check"})
+    return await call_next(request)
+
+rate_limit_buckets: Dict[str, Dict[str, float]] = {}
+
+def get_rate_limit_key(request: Request) -> str:
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        digest = hashlib.sha256(auth_header.removeprefix("Bearer ").strip().encode("utf-8")).hexdigest()
+        return f"auth:{digest}"
+    client_ip = request.client.host if request.client else "unknown"
+    return f"ip:{client_ip}"
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    now = time.time()
+    key = get_rate_limit_key(request)
+    has_bearer = request.headers.get("authorization", "").startswith("Bearer ")
+    max_requests = RATE_LIMIT_AUTH_MAX_REQUESTS if has_bearer else RATE_LIMIT_MAX_REQUESTS
+    bucket = rate_limit_buckets.get(key)
+
+    if not bucket or bucket["reset_at"] <= now:
+        rate_limit_buckets[key] = {"count": 1, "reset_at": now + RATE_LIMIT_WINDOW_SECONDS}
+        return await call_next(request)
+
+    bucket["count"] += 1
+    if bucket["count"] > max_requests:
+        retry_after = max(1, int(bucket["reset_at"] - now))
+        return JSONResponse(status_code=429, headers={"Retry-After": str(retry_after)}, content={"error": "Слишком много запросов", "retryAfter": retry_after})
+
+    if len(rate_limit_buckets) > 10000:
+        expired = [k for k, v in rate_limit_buckets.items() if v["reset_at"] <= now]
+        for k in expired:
+            rate_limit_buckets.pop(k, None)
+
+    return await call_next(request)
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    api_keys = load_api_keys()
+    if not api_keys:
+        return await call_next(request)
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(status_code=401, content={"error": "Требуется авторизация"})
+
+    token = auth_header.removeprefix("Bearer ").strip()
+    if not is_authorized_api_key(token, api_keys):
+        return JSONResponse(status_code=401, content={"error": "Недействительный токен"})
+
+    return await call_next(request)
 
 async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, Any], model: str):
     queue: asyncio.Queue = asyncio.Queue()
@@ -605,6 +782,7 @@ async def _stream_openai_response(token_info, chat_id: str, payload: Dict[str, A
             task.cancel()
 
 async def handle_chat_completions(body: Dict[str, Any]):
+    validate_request_payload(body)
     messages = _extract_messages(body)
     if not messages:
         return JSONResponse(status_code=400, content={"error": "Сообщения не указаны"})

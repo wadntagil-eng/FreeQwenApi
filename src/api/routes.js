@@ -2,12 +2,15 @@ import express from 'express';
 import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken } from './chat.js';
 import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
 import { checkAuthentication } from '../browser/auth.js';
-import { logInfo, logError, logDebug } from '../logger/index.js';
+import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
 import { getMappedModel } from './modelMapping.js';
 import { getStsToken, uploadFileToQwen } from './fileUpload.js';
 import { loadHistory, saveHistory } from './chatHistory.js';
 import { generateImage, getAvailableImageModels, checkImageApiAvailability } from './imageGeneration.js';
-import { MAX_FILE_SIZE, UPLOADS_DIR, DEFAULT_MODEL, STREAMING_CHUNK_DELAY, ALLOW_UNSCOPED_SESSION_CHAT_RESTORE } from '../config.js';
+import {
+    MAX_FILE_SIZE, UPLOADS_DIR, DEFAULT_MODEL, STREAMING_CHUNK_DELAY,
+    ALLOW_UNSCOPED_SESSION_CHAT_RESTORE, MAX_REQUEST_MESSAGES, MAX_REQUEST_TEXT_CHARS
+} from '../config.js';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
@@ -273,27 +276,63 @@ setInterval(() => {
 }, 600000); // 10 минут
 
 const router = express.Router();
+let warnedAboutDisabledAuth = false;
 
 // ─── Multer для загрузки файлов ──────────────────────────────────────────────
 
+const SAFE_UPLOAD_NAME_MAX_LENGTH = 120;
+
+function sanitizeUploadFilename(originalName = '') {
+    const baseName = path.basename(String(originalName));
+    const extension = path.extname(baseName).toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 16);
+    const stem = path.basename(baseName, path.extname(baseName))
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9._-]+/g, '-')
+        .replace(/^[.-]+|[.-]+$/g, '')
+        .slice(0, SAFE_UPLOAD_NAME_MAX_LENGTH);
+
+    const safeStem = stem || 'upload';
+    return `${Date.now()}-${crypto.randomBytes(8).toString('hex')}-${safeStem}${extension}`;
+}
+
 const storage = multer.diskStorage({
     destination(req, file, cb) {
-        const uploadDir = path.join(process.cwd(), UPLOADS_DIR);
-        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+        const uploadDir = path.resolve(process.cwd(), UPLOADS_DIR);
+        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true, mode: 0o700 });
         cb(null, uploadDir);
     },
     filename(req, file, cb) {
-        cb(null, Date.now() + '-' + crypto.randomBytes(8).toString('hex') + '-' + file.originalname);
+        cb(null, sanitizeUploadFilename(file.originalname));
     }
 });
 
-const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
+const upload = multer({
+    storage,
+    limits: { fileSize: MAX_FILE_SIZE, files: 1 },
+    preservePath: false
+});
 
 // ─── Auth middleware ─────────────────────────────────────────────────────────
 
+function isAuthorizedApiKey(token, apiKeys) {
+    const tokenBuffer = Buffer.from(token);
+
+    return apiKeys.some(apiKey => {
+        const apiKeyBuffer = Buffer.from(apiKey);
+        return tokenBuffer.length === apiKeyBuffer.length && crypto.timingSafeEqual(tokenBuffer, apiKeyBuffer);
+    });
+}
+
 function authMiddleware(req, res, next) {
     const apiKeys = getApiKeys();
-    if (apiKeys.length === 0) return next();
+    if (apiKeys.length === 0) {
+        if (!warnedAboutDisabledAuth) {
+            logWarn('Авторизация API отключена: файл Authorization.txt пуст или содержит только комментарии');
+            warnedAboutDisabledAuth = true;
+        }
+        return next();
+    }
 
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -302,7 +341,7 @@ function authMiddleware(req, res, next) {
     }
 
     const token = authHeader.substring(7).trim();
-    if (!apiKeys.includes(token)) {
+    if (!isAuthorizedApiKey(token, apiKeys)) {
         logError('Предоставлен недействительный API ключ');
         return res.status(401).json({ error: 'Недействительный токен' });
     }
@@ -310,6 +349,33 @@ function authMiddleware(req, res, next) {
 }
 
 router.use(authMiddleware);
+
+function countTextCharacters(value) {
+    if (typeof value === 'string') return value.length;
+    if (Array.isArray(value)) return value.reduce((sum, item) => sum + countTextCharacters(item), 0);
+    if (value && typeof value === 'object') {
+        return Object.values(value).reduce((sum, item) => sum + countTextCharacters(item), 0);
+    }
+    return 0;
+}
+
+function requestSizeGuard(req, res, next) {
+    const body = req.body || {};
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+
+    if (messages.length > MAX_REQUEST_MESSAGES) {
+        return res.status(413).json({ error: `Слишком много сообщений в запросе: максимум ${MAX_REQUEST_MESSAGES}` });
+    }
+
+    const textCharacters = countTextCharacters(body);
+    if (textCharacters > MAX_REQUEST_TEXT_CHARS) {
+        return res.status(413).json({ error: `Слишком большой текстовый payload: максимум ${MAX_REQUEST_TEXT_CHARS} символов` });
+    }
+
+    return next();
+}
+
+router.use(requestSizeGuard);
 router.use((req, res, next) => {
     req.url = req.url.replace(/\/v[12](?=\/|$)/g, '').replace(/\/+/g, '/');
     next();
